@@ -1,0 +1,111 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>VRMアバター（表情・体で動く）</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22%3E%3Ctext y=%22.9em%22 font-size=%2290%22%3E%F0%9F%A7%91%3C/text%3E%3C/svg%3E">
+<link rel="stylesheet" href="css/style.css?v=20261124">
+<script type="importmap">{ "imports": { "three": "./vendor/three/three.module.min.js", "three/addons/": "./vendor/three/addons/" } }</script>
+</head>
+<body>
+<header>
+  <h1>VRMアバター</h1>
+  <span id="camStatus" class="pill wait">判定：準備中…</span>
+  <span id="stageStatus" class="pill ng">出力画面：未接続</span>
+  <span class="spacer"></span>
+  <button id="btnCam" class="primary" disabled>▶ カメラ開始</button>
+  <button id="btnOpenStage">出力画面を開く</button>
+  <button id="btnFull" title="キャラクターだけを全画面表示（F）">全画面</button>
+  <button id="btnPanel" title="右の設定を隠す／出す（H）">設定を隠す</button>
+</header>
+
+<main>
+  <section id="stageWrap">
+    <div id="viewArea">
+      <canvas id="cv"></canvas>
+      <div id="viewHelp">左ドラッグ：回す　右ドラッグ／Shift＋ドラッグ：移動　ホイール／ピンチ：ズーム</div>
+      <div id="countdown" class="hide"></div>
+      <div id="dropHint">ここに .vrm ファイルをドロップ</div>
+    </div>
+    <div id="monitor">
+      <div id="camBox">
+        <video id="video" playsinline muted></video>
+        <canvas id="ov"></canvas>
+        <div id="monLabel">カメラ停止中</div>
+      </div>
+      <div id="guide">
+        <div class="gh"><small>いまの出力</small><b id="gNow">—</b><span class="gleg">バーが白い線 ┃ を越えると反応　／　✓ が付いた行がキャラクターに反映中</span></div>
+        <div class="gcols">
+          <div><div class="gcap"><span>顔をこうすると</span><span></span><span>こう変わる</span></div><div id="gFace"></div></div>
+          <div><div class="gcap"><span>頭・体をこうすると</span><span></span><span>こう変わる</span></div><div id="gBody"></div></div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <aside>
+    <div class="card">
+      <h2>VRMモデル</h2>
+      <div id="modelInfo" class="model">読み込み中…</div>
+      <div class="row"><button id="btnFile" class="primary">VRMファイルを選ぶ</button><span class="spacer"></span><button id="btnSample">サンプル</button></div>
+      <input id="fileVrm" type="file" accept=".vrm,.glb" hidden>
+      <p class="note">.vrm ファイルを左の画面にドラッグしても読み込めます。VRoid Studio などで書き出した VRM 0.x・1.0 に対応。モデルはこのブラウザの中だけに保存されます。</p>
+    </div>
+
+    <div class="card">
+      <h2>表情の判定 <span class="muted" id="fps"></span></h2>
+      <div id="meters"></div>
+      <p class="note">バーが縦線を越えると反応します。スライダーで縦線（しきい値）を動かせます。左にするほど反応しやすくなります。</p>
+      <div class="row"><button id="btnCalib" class="primary">いつもの顔を登録</button><span class="spacer"></span><button id="btnResetDetect">元に戻す</button></div>
+      <p class="note">最初に、正面を向いて力を抜いた顔と姿勢で押してください（3秒後に記録）。人による違いが補正されます。</p>
+      <div class="row"><label for="rngHold">切り替えの間</label><input id="rngHold" type="range" min="0" max="800" step="10"><output id="outHold"></output></div>
+      <div class="row"><label>表情</label><div id="faceButtons" class="faces"></div></div>
+      <p class="note"><kbd>0</kbd> 自動（顔で判定）／<kbd>1</kbd>〜<kbd>5</kbd> 表情を固定（まばたき・口はカメラのまま）。</p>
+    </div>
+
+    <div class="card">
+      <h2>動き</h2>
+      <div class="row"><label for="rngHead">頭の動き</label><input id="rngHead" type="range" min="0" max="1.5" step="0.05"><output id="outHead"></output></div>
+      <div class="row"><label for="rngBody">体の動き</label><input id="rngBody" type="range" min="0" max="1.5" step="0.05"><output id="outBody"></output></div>
+      <div class="row"><label for="rngSmooth">なめらかさ</label><input id="rngSmooth" type="range" min="0" max="0.9" step="0.05"><output id="outSmooth"></output></div>
+      <div class="row"><label class="check"><input id="chkPose" type="checkbox"> 上半身（肩・腕）も動かす</label></div>
+      <div class="row"><label class="check"><input id="chkGaze" type="checkbox"> 目線を動かす</label></div>
+      <div class="row"><label class="check"><input id="chkWink" type="checkbox"> ウインク（左右別々のまばたき）</label></div>
+      <div class="row"><label class="check"><input id="chkMirror" type="checkbox"> 鏡のように動かす（カメラ映像を左右反転）</label></div>
+      <p class="note">腕は、ひじがカメラに映ったときに動きます（カメラから少し離れると映ります）。映っていないときは自然に下ろした形になります。</p>
+    </div>
+
+    <div class="card">
+      <h2>見え方</h2>
+      <div class="row"><label>背景色</label>
+        <div class="seg" id="bgButtons">
+          <button data-bg="#00ff00"><i style="background:#00ff00"></i>緑</button>
+          <button data-bg="#0000ff"><i style="background:#0000ff"></i>青</button>
+          <button data-bg="#ff00ff"><i style="background:#ff00ff"></i>マゼンタ</button>
+          <button data-bg="#ffffff"><i style="background:#ffffff"></i>白</button>
+        </div>
+      </div>
+      <div class="row"><label></label><span class="muted">ほかの色</span><input id="bgCustom" type="color" title="ほかの色" value="#00ff00"></div>
+      <div class="row"><label>構図</label>
+        <div class="seg"><button data-frame="face">顔</button><button data-frame="bust">上半身</button><button data-frame="full">全身</button></div>
+      </div>
+      <div class="row"><label for="rngRot">体の向き</label><input id="rngRot" type="range" min="-180" max="180" step="5"><output id="outRot"></output></div>
+      <div class="row"><span class="spacer"></span><button id="btnFront">正面・上半身に戻す</button></div>
+      <p class="note">プレビューをドラッグして、回す・動かす・ズームができます。出力画面も同じ構図・背景色になります。</p>
+    </div>
+
+    <div class="card">
+      <h2>カメラ</h2>
+      <div class="row"><label for="selCam">使うカメラ</label><select id="selCam"><option value="">標準のカメラ</option></select></div>
+      <div class="row"><label class="check"><input id="chkMonitor" type="checkbox"> カメラ映像とガイドを表示（<kbd>M</kbd>）</label></div>
+      <p class="note">カメラの映像はこのパソコンの中だけで処理され、どこにも送られません。</p>
+    </div>
+  </aside>
+</main>
+<div id="toast" class="hide"></div>
+<script src="js/common.js?v=20261124"></script>
+<script src="js/detect.js?v=20261124"></script>
+<script type="module" src="js/app.js?v=20261124"></script>
+</body>
+</html>
