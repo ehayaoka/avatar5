@@ -1,5 +1,5 @@
 /* 操作画面：カメラで顔と上半身の動きを読み取り、VRM の表情・頭・体・腕を動かす。 */
-import { FilesetResolver, FaceLandmarker, PoseLandmarker } from '../vendor/mediapipe/vision_bundle.mjs';
+import { FilesetResolver, FaceLandmarker, PoseLandmarker, HandLandmarker } from '../vendor/mediapipe/vision_bundle.mjs';
 import { VRMView, neutralState } from './scene.js';
 
 const $ = s => document.querySelector(s);
@@ -15,7 +15,7 @@ const DEFAULT_THR = { blink: 0.35, mouth: 0.08, ou: 0.4, happy: 0.35, angry: 0.2
 const DEFAULTS = {
   thr: { ...DEFAULT_THR }, base: null, baseX: null, holdMs: 120,
   bg: '#00ff00', view: null, rotY: 0, head: 1, body: 1, smooth: 0.35,
-  usePose: true, useGaze: true, wink: false, mirror: true, monitor: true, camId: '',
+  usePose: true, useHands: true, useGaze: true, wink: false, mirror: true, monitor: true, camId: '',
 };
 let S = load();
 function load() {
@@ -97,7 +97,7 @@ ch.onmessage = ev => {
 setInterval(() => { const ok = Date.now() - lastStageSeen < 2500; pill('#stageStatus', ok ? '出力画面：接続中' : '出力画面：未接続', ok ? 'ok' : 'ng'); }, 1000);
 
 /* ---------- 顔・上半身の判定（MediaPipe） ---------- */
-let faceLM = null, poseLM = null, stream = null, running = false;
+let faceLM = null, poseLM = null, handLM = null, stream = null, running = false;
 const video = $('#video');
 async function initModel() {
   pill('#camStatus', '判定：準備中…', 'wait');
@@ -111,6 +111,8 @@ async function initModel() {
   faceLM = await mk(FaceLandmarker, 'face_landmarker.task', { numFaces: 1, outputFaceBlendshapes: true });
   try { poseLM = await mk(PoseLandmarker, 'pose_landmarker_lite.task', { numPoses: 1 }); }
   catch (e) { console.warn('上半身の判定を使えません', e); poseLM = null; }
+  try { handLM = await mk(HandLandmarker, 'hand_landmarker.task', { numHands: 2, minHandDetectionConfidence: 0.5, minHandPresenceConfidence: 0.5, minTrackingConfidence: 0.5 }); }
+  catch (e) { console.warn('手の判定を使えません', e); handLM = null; }
   pill('#camStatus', '判定：カメラ停止中', 'wait');
   $('#btnCam').disabled = false;
 }
@@ -132,7 +134,7 @@ async function startCamera() {
   listCameras();
 }
 function stopCamera() {
-  running = false; T.face = false; T.arms = { L: null, R: null }; T.body = false;
+  running = false; T.face = false; T.arms = { L: null, R: null }; T.body = false; T.hands = { L: null, R: null };
   if (stream) stream.getTracks().forEach(t => t.stop()); stream = null; video.srcObject = null;
   $('#btnCam').textContent = '▶ カメラ開始'; $('#btnCam').classList.add('primary');
   if (faceLM) pill('#camStatus', '判定：カメラ停止中', 'wait');
@@ -154,7 +156,7 @@ const judge = new DETECT.Judge();
 const BASE0 = { ...DETECT.DEFAULT_BASE, blink: 0.12, pucker: 0.05, funnel: 0.02 };
 const BX0 = { roll: 0, yaw: 0, pitch: 0.48, cx: 0.5, cy: 0.45, gh: 0, gv: 0, earL: 0.28, earR: 0.28, sTilt: 0, sMid: 0.5, sTwist: 0 };
 // T：いまの判定結果（ガイドと出力のもと）
-const T = { face: false, body: false, f: null, sc: null, r: null, ratio: {}, out: neutralState(), arms: { L: null, R: null }, raw: {} };
+const T = { face: false, body: false, f: null, sc: null, r: null, ratio: {}, out: neutralState(), arms: { L: null, R: null }, hands: { L: null, R: null }, handPts: [], raw: {} };
 let lastVideoTime = -1, lastTs = 0, lastSeen = 0, manual = null, calib = null, frames = 0, fpsT = performance.now();
 const D = (a, b) => Math.hypot(a[0] - b[0], a[1] - b[1]);
 
@@ -207,6 +209,67 @@ function bodyGeom(lm, wl, vw, vh) {
   return { tilt, twist, mid, L: arm(11, 13, 15), R: arm(12, 14, 16), sL, sR };
 }
 
+/* 手：指の曲がり（関節ごとの角度）と、手首の向き（指先の方向・手のひらの向き） */
+const HAND_CONN = [[0, 1], [1, 2], [2, 3], [3, 4], [0, 5], [5, 6], [6, 7], [7, 8], [5, 9], [9, 10], [10, 11], [11, 12], [9, 13], [13, 14], [14, 15], [15, 16], [13, 17], [17, 18], [18, 19], [19, 20], [0, 17]];
+const sub = (a, b) => [a.x - b.x, a.y - b.y, a.z - b.z];
+const len3 = v => Math.hypot(v[0], v[1], v[2]) || 1e-6;
+const ang3 = (u, v) => Math.acos(clamp((u[0] * v[0] + u[1] * v[1] + u[2] * v[2]) / len3(u) / len3(v), -1, 1)) * R2D;
+const cross3 = (a, b) => [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]];
+function fingerCurls(w) {
+  const c = [];
+  // 親指：付け根は「親指の先が小指の付け根に近づいた度合い」、中・先は関節の角度
+  const palm = len3(sub(w[5], w[17])), r = len3(sub(w[4], w[17])) / palm;
+  c.push(clamp((1.6 - r) / 1.0, 0, 1) * 45, clamp(ang3(sub(w[2], w[1]), sub(w[3], w[2])) - 10, 0, 70), clamp(ang3(sub(w[3], w[2]), sub(w[4], w[3])) - 5, 0, 80));
+  for (const b of [5, 9, 13, 17]) {
+    c.push(clamp(ang3(sub(w[b], w[0]), sub(w[b + 1], w[b])) - 8, 0, 95),
+           clamp(ang3(sub(w[b + 1], w[b]), sub(w[b + 2], w[b + 1])) - 5, 0, 105),
+           clamp(ang3(sub(w[b + 2], w[b + 1]), sub(w[b + 3], w[b + 2])) - 5, 0, 80));
+  }
+  return c;
+}
+function handShape(c) {
+  const ext = [1, 2, 3, 4].map(i => c[i * 3] + c[i * 3 + 1] < 75), thumb = c[0] < 20 && c[1] + c[2] < 60;
+  const n = ext.filter(Boolean).length;
+  if (n === 4) return 'パー';
+  if (n === 0) return thumb ? 'グッド' : 'グー';
+  if (ext[0] && ext[1] && !ext[2] && !ext[3]) return 'ピース';
+  if (ext[0] && !ext[1] && !ext[2] && !ext[3]) return '指さし';
+  return '指を曲げる';
+}
+function trackHands(hr, plm, flm, vw, vh) {
+  T.handPts = [];
+  const got = { L: null, R: null };
+  if (hr && hr.landmarks && hr.landmarks.length) {
+    const cx = flm ? flm[1].x : 0.5;
+    const list = hr.landmarks.map((lm, i) => {
+      const wx = lm[0].x, wy = lm[0].y;
+      // 人のどちらの手か：上半身の手首に近いほう（見えないときは顔より右か左か。カメラ映像では人の左手が右に映る）
+      let side = wx > cx ? 'L' : 'R';
+      if (plm && S.usePose) {
+        const d = j => (VIS(plm[j], 0.3) ? Math.hypot((plm[j].x - wx) * vw, (plm[j].y - wy) * vh) : 1e9);
+        const dl = d(15), dr = d(16);
+        if (Math.min(dl, dr) < 1e8) side = dl <= dr ? 'L' : 'R';
+      }
+      return { lm, w: hr.worldLandmarks[i], side, x: wx };
+    });
+    if (list.length === 2 && list[0].side === list[1].side) { const [a, b] = list[0].x > list[1].x ? [list[0], list[1]] : [list[1], list[0]]; a.side = 'L'; b.side = 'R'; }
+    for (const h of list) {
+      const cs = S.mirror ? (h.side === 'L' ? 'R' : 'L') : h.side;   // キャラのどちらの手か
+      const mir = S.mirror ? -1 : 1, cv = v => [mir * v[0], -v[1], -v[2]];
+      const w = h.w, curl = fingerCurls(w);
+      let d = null, n = null;
+      if (T.body && T.arms[cs]) {   // 腕が映っているときだけ手首も回す
+        d = cv(sub(w[9], w[0]));
+        const cr = cross3(cv(sub(w[5], w[0])), cv(sub(w[17], w[0]))), sg = cs === 'L' ? -1 : 1;
+        const ln = Math.hypot(...cr) || 1; n = cr.map(x => x * sg / ln);
+      }
+      got[cs] = { c: curl, d, n, shape: handShape(curl), person: h.side };
+      T.handPts.push({ lm: h.lm, cs });
+    }
+  }
+  T.hands = got;
+}
+
 function tick() {
   if (running && faceLM && video.readyState >= 2 && video.currentTime !== lastVideoTime) {
     lastVideoTime = video.currentTime;
@@ -214,19 +277,21 @@ function tick() {
     try {
       const fr = faceLM.detectForVideo(video, ts);
       const pr = S.usePose && poseLM ? poseLM.detectForVideo(video, ts) : null;
-      onResult(fr, pr, ts); frames++;
+      const hr = S.useHands && handLM ? handLM.detectForVideo(video, ts) : null;
+      onResult(fr, pr, hr, ts); frames++;
     } catch (e) { console.error(e); }
   }
   const now = performance.now();
   if (now - fpsT > 1000) { $('#fps').textContent = running ? `${Math.round(frames * 1000 / (now - fpsT))}fps` : ''; frames = 0; fpsT = now; }
   publish(now);
 }
-function onResult(fr, pr, now) {
+function onResult(fr, pr, hr, now) {
   const vw = video.videoWidth || 640, vh = video.videoHeight || 480;
   const bs = fr.faceBlendshapes && fr.faceBlendshapes[0], lm = fr.faceLandmarks && fr.faceLandmarks[0];
   const plm = pr && pr.landmarks && pr.landmarks[0], pwl = pr && pr.worldLandmarks && pr.worldLandmarks[0];
   const body = plm ? bodyGeom(plm, pwl, vw, vh) : null;
   T.bodyGeom = body;
+  trackHands(hr, plm, lm, vw, vh);
   if (!bs || !lm) {
     if (now - lastSeen > 300) {
       T.face = false; pill('#camStatus', '判定：顔が見つかりません', 'ng'); $('#monLabel').textContent = '顔が見つかりません'; $('#monLabel').className = 'lost';
@@ -320,6 +385,16 @@ function track(f, p, g, body) {
     const mixv = (pv, nv) => { const r = pv ? pv.map((x, i) => x + (nv[i] - x) * a) : nv.slice(); const l = Math.hypot(...r) || 1; return r.map(x => x / l); };
     o.arms[side] = { up: mixv(prev && prev.up, n.up), low: mixv(prev && prev.low, n.low) };
   }
+  smoothHands(a);
+}
+function smoothHands(a) {
+  const o = T.out;
+  for (const side of ['L', 'R']) {
+    const n = S.useHands ? T.hands[side] : null, prev = o.hands[side];
+    if (!n) { o.hands[side] = null; continue; }
+    const c = prev ? prev.c.map((x, i) => x + (n.c[i] - x) * Math.min(1, a * 1.3)) : n.c.slice();
+    o.hands[side] = { c, d: n.d, n: n.n };
+  }
 }
 
 /* 出力：顔が見えないとき・カメラ停止中は、自動でまばたきだけする */
@@ -334,8 +409,9 @@ function publish(now) {
     if (now > idleBlinkAt) { ex.blink = 1; if (now > idleBlinkAt + 130) idleBlinkAt = now + 2500 + Math.random() * 3000; }
     o.expr = ex;
     if (!running || !T.body) o.arms = { L: null, R: null };
+    if (!running) o.hands = { L: null, R: null };
   }
-  const state = { expr: o.expr, headX: o.headX, headY: o.headY, headZ: o.headZ, leanZ: o.leanZ, twistY: o.twistY, lookYaw: o.lookYaw, lookPitch: o.lookPitch, arms: o.arms, breath: true };
+  const state = { expr: o.expr, headX: o.headX, headY: o.headY, headZ: o.headZ, leanZ: o.leanZ, twistY: o.twistY, lookYaw: o.lookYaw, lookPitch: o.lookPitch, arms: o.arms, hands: o.hands, breath: true };
   view.setGoal(state);
   if (now - sentAt > 30) { sentAt = now; ch.postMessage({ type: 'state', state }); }
   updateGuide();
@@ -370,6 +446,8 @@ const GUIDE = [
   { id: 'twistY', act: '体をひねる', to: '体が回る', color: '#22d3ee', bi: true, max: 30, dir: ['左へ回る', '右へ回る'], pose: true },
   { id: 'armS', act: '', to: '', color: '#f472b6', arm: 'S' },
   { id: 'armO', act: '', to: '', color: '#f472b6', arm: 'O' },
+  { id: 'handS', act: '', to: '', color: '#fbbf24', hand: 'S' },
+  { id: 'handO', act: '', to: '', color: '#fbbf24', hand: 'O' },
 ];
 const gEls = {};
 function buildGuide() {
@@ -395,7 +473,16 @@ function updateGuide() {
   for (const id in gEls) {
     const { row, fill, res, txt, g } = gEls[id];
     let act = false, text = '→ ' + g.to;
-    if (g.arm) {
+    if (g.hand) {
+      const sideC = (g.hand === 'S') ? 'L' : 'R', handName = (g.hand === 'S') === S.mirror ? '右手' : '左手';
+      txt.textContent = `${handName}の指を曲げる`;
+      if (!S.useHands || !handLM) { row.classList.add('na'); fill.style.width = '0'; res.textContent = handLM || !running ? '（オフ）' : '（使えません）'; row.classList.remove('on'); continue; }
+      row.classList.remove('na');
+      const h = running ? T.hands[sideC] : null;
+      const v = h ? clamp([3, 6, 9, 12].reduce((s2, i) => s2 + h.c[i] + h.c[i + 1], 0) / 4 / 170, 0.04, 1) : 0;
+      fill.style.left = '0'; fill.style.width = v * 100 + '%';
+      act = !!h; text = h ? `✓ ${sideC === 'L' ? '右' : '左'}側の手：${h.shape}` : '→ 指が動く';
+    } else if (g.arm) {
       const a = armRows().find(x => x.id === id), tracked = running && T.body && T.arms[a.side];
       txt.textContent = `${a.hand}を上げる`;
       if (!S.usePose) { row.classList.add('na'); fill.style.width = '0'; res.textContent = '（オフ）'; row.classList.remove('on'); continue; }
@@ -458,6 +545,11 @@ function drawOverlay(lm, plm, body, geo) {
       if (VIS(plm[e], 0.3)) seg(s, e, c, tr ? 3 : 1.5);
       if (tr && body[side].low) seg(e, w, c, 3);
     }
+  }
+  if (S.useHands) for (const h of T.handPts) {
+    og.strokeStyle = col('handS'); og.lineWidth = 2;
+    for (const [a1, b1] of HAND_CONN) { const [x1, y1] = Q(h.lm[a1]), [x2, y2] = Q(h.lm[b1]); og.beginPath(); og.moveTo(x1, y1); og.lineTo(x2, y2); og.stroke(); }
+    for (const t of [4, 8, 12, 16, 20]) { const [x, y] = Q(h.lm[t]); og.beginPath(); og.arc(x, y, 3, 0, 7); og.fillStyle = col('handS'); og.fill(); }
   }
   if (!lm) return;
   const P = i => Q(lm[i]);
@@ -587,7 +679,7 @@ function bindUI() {
   bindRange('#rngBody', '#outBody', () => S.body, v => { S.body = v; }, v => `${Math.round(v * 100)}%`);
   bindRange('#rngSmooth', '#outSmooth', () => S.smooth, v => { S.smooth = v; }, v => `${Math.round(v * 100)}%`);
   bindRange('#rngRot', '#outRot', () => S.rotY, v => { S.rotY = v; view.setModelRot(v); lastViewSent = 0; sendView(); }, v => `${v}°`);
-  for (const [id, key, fn] of [['#chkPose', 'usePose'], ['#chkGaze', 'useGaze'], ['#chkWink', 'wink'], ['#chkMirror', 'mirror', applyMirror], ['#chkMonitor', 'monitor', applyMonitor]]) {
+  for (const [id, key, fn] of [['#chkPose', 'usePose'], ['#chkHands', 'useHands'], ['#chkGaze', 'useGaze'], ['#chkWink', 'wink'], ['#chkMirror', 'mirror', applyMirror], ['#chkMonitor', 'monitor', applyMonitor]]) {
     const c = $(id); c.checked = S[key];
     c.onchange = () => { S[key] = c.checked; save(); fn && fn(); c.blur(); };
   }

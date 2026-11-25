@@ -12,11 +12,23 @@ export const REST = {
   L: { up: new THREE.Vector3(0.42, -0.9, 0.06).normalize(), low: new THREE.Vector3(0.28, -0.9, 0.3).normalize() },
   R: { up: new THREE.Vector3(-0.42, -0.9, 0.06).normalize(), low: new THREE.Vector3(-0.28, -0.9, 0.3).normalize() },
 };
-export const neutralState = () => ({ expr: {}, headX: 0, headY: 0, headZ: 0, leanZ: 0, twistY: 0, lookYaw: 0, lookPitch: 0, arms: { L: null, R: null }, breath: true });
+export const neutralState = () => ({ expr: {}, headX: 0, headY: 0, headZ: 0, leanZ: 0, twistY: 0, lookYaw: 0, lookPitch: 0, arms: { L: null, R: null }, hands: { L: null, R: null }, breath: true });
+/* 指：親指（付け根・中・先）、人差し指・中指・薬指・小指（付け根・中・先）の曲がり（度）。15個 */
+export const FINGERS = [['Thumb', ['Metacarpal', 'Proximal', 'Distal']], ['Index', ['Proximal', 'Intermediate', 'Distal']], ['Middle', ['Proximal', 'Intermediate', 'Distal']], ['Ring', ['Proximal', 'Intermediate', 'Distal']], ['Little', ['Proximal', 'Intermediate', 'Distal']]];
+export const RELAXED = [5, 8, 8, 12, 14, 8, 14, 16, 8, 16, 18, 8, 18, 20, 10];   // 手が映っていないときの、軽く曲げた指
 
 const _q = new THREE.Quaternion(), _q2 = new THREE.Quaternion(), _e = new THREE.Euler(0, 0, 0, 'YXZ');
 const _v = new THREE.Vector3(), _q3 = new THREE.Quaternion();
-const X_POS = new THREE.Vector3(1, 0, 0), X_NEG = new THREE.Vector3(-1, 0, 0);
+const X_POS = new THREE.Vector3(1, 0, 0), X_NEG = new THREE.Vector3(-1, 0, 0), Y_NEG = new THREE.Vector3(0, -1, 0);
+const _m = new THREE.Matrix4(), _qa = new THREE.Quaternion(), _qb = new THREE.Quaternion(), _a1 = new THREE.Vector3(), _a2 = new THREE.Vector3(), _a3 = new THREE.Vector3();
+const AX_Z = new THREE.Vector3(0, 0, 1);
+/* 2つの向き（指先の方向 dir と手のひらの向き n）から回転を作る */
+function frameQ(dir, n, out) {
+  _a1.copy(dir).normalize(); _a2.copy(n).addScaledVector(_a1, -n.dot(_a1));
+  if (_a2.lengthSq() < 1e-6) _a2.set(0, -1, 0).addScaledVector(_a1, _a1.y);
+  _a2.normalize(); _a3.crossVectors(_a1, _a2);
+  return out.setFromRotationMatrix(_m.makeBasis(_a1, _a2, _a3));
+}
 
 export class VRMView {
   constructor(canvas, { controls = false, fixed = null } = {}) {
@@ -41,6 +53,8 @@ export class VRMView {
     this.camera.lookAt(this.target);
     this.vrm = null; this.modelRotY = 0;
     this.goal = neutralState(); this.cur = neutralState(); this.cur.arms = this._restArms(); this.goalArms = this._restArms();
+    const hs = () => ({ curl: RELAXED.slice(), dir: new THREE.Vector3(), n: new THREE.Vector3(0, -1, 0), w: 0 });
+    this.cur.hands = { L: hs(), R: hs() }; this.goalHands = { L: hs(), R: hs() };
     this.clock = new THREE.Clock(); this.t = 0;
     this.onFrame = null;
     this._loop = this._loop.bind(this); requestAnimationFrame(this._loop);
@@ -115,6 +129,9 @@ export class VRMView {
       const a = s.arms && s.arms[side], g = this.goalArms[side];
       if (a) { g.up.fromArray(a.up).normalize(); g.low.fromArray(a.low).normalize(); }
       else { g.up.copy(REST[side].up); g.low.copy(REST[side].low); }
+      const h = s.hands && s.hands[side], gh = this.goalHands[side];
+      gh.curl = h && h.c ? h.c : RELAXED;
+      if (h && h.d && h.n) { gh.dir.fromArray(h.d).normalize(); gh.n.fromArray(h.n).normalize(); gh.w = 1; } else gh.w = 0;
     }
   }
 
@@ -128,7 +145,13 @@ export class VRMView {
       const c = this.cur, g = this.goal;
       for (const a of ANGLES) c[a] += ((g[a] || 0) - c[a]) * k;
       for (const n of EXPRESSIONS) { const v = (g.expr && g.expr[n]) || 0; c.expr[n] = (c.expr[n] || 0) + (v - (c.expr[n] || 0)) * (n.startsWith('blink') ? 0.6 : k); }
-      for (const side of ['L', 'R']) { c.arms[side].up.lerp(this.goalArms[side].up, ka).normalize(); c.arms[side].low.lerp(this.goalArms[side].low, ka).normalize(); }
+      for (const side of ['L', 'R']) {
+        c.arms[side].up.lerp(this.goalArms[side].up, ka).normalize(); c.arms[side].low.lerp(this.goalArms[side].low, ka).normalize();
+        const ch = c.hands[side], gh = this.goalHands[side];
+        for (let i = 0; i < 15; i++) ch.curl[i] += ((gh.curl[i] || 0) - ch.curl[i]) * k;
+        ch.w += (gh.w - ch.w) * ka;
+        if (gh.w > 0) { if (ch.dir.lengthSq() < 0.5) { ch.dir.copy(gh.dir); ch.n.copy(gh.n); } else { ch.dir.lerp(gh.dir, ka).normalize(); ch.n.lerp(gh.n, ka).normalize(); } }
+      }
       this._applyPose(c, this.t);
       this.vrm.update(dt);
     }
@@ -153,14 +176,44 @@ export class VRMView {
       const pre = side === 'L' ? 'left' : 'right', rest = side === 'L' ? X_POS : X_NEG;
       const up = node(pre + 'UpperArm'), low = node(pre + 'LowerArm'), hand = node(pre + 'Hand');
       if (!up || !low) continue;
-      const a = c.arms[side];
-      this._aim(up, rest, a.up); this._aim(low, rest, a.low);
-      if (hand) hand.quaternion.identity();
+      const a = c.arms[side], h = c.hands[side];
+      this._aim(up, rest, a.up);
+      if (h.w > 0.01 && hand && h.dir.lengthSq() > 0.5) {
+        // 手首の向き：ひねりの7割を前腕で、残りと曲げを手首で受けもつ（ねじれ過ぎを防ぐ）
+        const want = this._world(_qb.setFromUnitVectors(rest, _v.copy(a.low)));   // ひねりなし
+        const tw = frameQ(a.low, h.n, _qa).multiply(_q.copy(frameQ(rest, Y_NEG, _q2)).invert());
+        low.quaternion.copy(this._local(low, want.slerp(tw, h.w * 0.7)));
+        const hw = frameQ(h.dir, h.n, _qa).multiply(_q.copy(frameQ(rest, Y_NEG, _q2)).invert());
+        const lowW = this._world(_qb.identity(), low);
+        hand.quaternion.copy(_q2.identity().slerp(lowW.invert().multiply(hw), h.w));
+      } else {
+        this._aim(low, rest, a.low);
+        if (hand) hand.quaternion.identity();
+      }
+      // 指：手のひら側（-Y）へ曲げる。親指は手のひらを横切る向きへ
+      const sg = side === 'L' ? -1 : 1;
+      FINGERS.forEach(([f, parts], fi) => parts.forEach((pt, j) => {
+        const b = node(pre + f + pt); if (!b) return;
+        const ang = (h.curl[fi * 3 + j] || 0) * D;
+        if (f === 'Thumb') b.quaternion.setFromEuler(_e.set(0, -sg * ang * 0.8, sg * ang * 0.35, 'YXZ'));
+        else b.quaternion.setFromAxisAngle(AX_Z, sg * ang);
+      }));
     }
     // 表情
     const em = vrm.expressionManager;
     if (em) for (const n of this.hasExpr) em.setValue(n, Math.max(0, Math.min(1, c.expr[n] || 0)));
     if (vrm.lookAt) { vrm.lookAt.yaw = c.lookYaw; vrm.lookAt.pitch = c.lookPitch; }
+  }
+  /* キャラ基準の回転 q を、bone（なければ bone の親）を基準にした世界の回転として返す／親からの回転に直す */
+  _world(q, bone) {
+    if (!bone) return q;
+    bone.updateWorldMatrix(true, false);
+    return bone.getWorldQuaternion(q).premultiply(_q3.copy(this.vrm.scene.quaternion).invert());
+  }
+  _local(bone, want) {
+    bone.parent.updateWorldMatrix(true, false);
+    const parentQ = bone.parent.getWorldQuaternion(_q2).premultiply(_q3.copy(this.vrm.scene.quaternion).invert());
+    return parentQ.invert().multiply(want);
   }
   /* 骨の向きを、キャラクターから見た方向 dir に向ける（体の回転を差し引いて親からの回転にする） */
   _aim(bone, restDir, dir) {
